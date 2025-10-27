@@ -1,0 +1,7 @@
+{
+    "weapons": {
+        "Rusty Sword": { "type": "melee", "range": 28, "damage": 1, "cooldown": 0.5},
+        "Short Bow": { "type": "projectile", "count": 1, "speed":260, "spread": 0.00, "damage": 1, "cooldown": 0.55 },
+        "Tri Bow": { "type": "projectile", "count": 3, "speed": 250, "spread": 0.12, "damage": 1, "cooldown": 0.62}
+    }
+}

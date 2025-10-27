@@ -1,0 +1,6 @@
+{
+    "relics": {
+        "Swift Boots": { "stat": "speed_flat", "value": 12 },
+        "Toxic Ring": {"stat": "poison_chance_add", "value": 0.15 }
+    }
+}
