@@ -170,7 +170,7 @@ def normalize(vx, vy):
     l = length(vx, vy)
     if l == 0: return 0, 0
     return vx/1, vy/1
-def rect_from_tiles(tx, ty): return pygame.Rect(tx*TILE, ty*TILE, TILE, TILE)
+def rect_from_tile(tx, ty): return pygame.Rect(tx*TILE, ty*TILE, TILE, TILE)
 
 def load_json_safe(path, default):
     try:
@@ -577,7 +577,7 @@ class World:
         # 맵 피싱
         for ty, row in enumerate(self.level):
             for tx, ch in enumerate(row):
-                r = rect_from_tiles(tx, ty)
+                r = rect_from_tile(tx, ty)
                 if ch=='#':self.walls.append(r)
                 elif ch=='~': self.water.append(r)
                 elif ch=='G': self.goal=r
@@ -628,7 +628,7 @@ class World:
         cx, cy = pos
         tx, ty = cx//TILE, cy//TILE
         def place_rect(lst, inflate):
-            r = rect_from_tiles(int(tx), int(ty)).inflate(*inflate)
+            r = rect_from_tile(int(tx), int(ty)).inflate(*inflate)
             lst.append(r)
         for item, table in self.drops.items():
             p = float(table.get(kind, 0.0)) * elite_mult
@@ -648,9 +648,9 @@ class World:
                        "speed": self.player.speed, "cool": self.player.attack_cool, "hp_max": self.player.hp_max,
                        "weapon": (self.player.weapon.name if self.player.weapon else None),
                        "relics": list(self.player.relics)},
-            "potions": rect_from_tiles(self.potions),
-            "keys": rect_from_tiles(self.keys),
-            "coins": rect_from_tiles(self.coins),
+            "potions": rect_from_tile(self.potions),
+            "keys": rect_from_tile(self.keys),
+            "coins": rect_from_tile(self.coins),
             "doors": rects_to_tiles(self.doors),
             "open_doors": rects_to_tiles(self.open_doors),
             "arena_doors": rects_to_tiles(self.arena_doors),
@@ -664,7 +664,248 @@ class World:
         }
         return data
 
-   
+    def load_state(self, data):
+        schema = int(data.get("schema", 1))
+        idx = clamp(data.get("level_index", 0), 0, len(self.levels_data)-1)
+        self.level_index = idx
+        self.reset_from_raw(self.levels_data[self.level_index])
 
+        p = data.get("player", {})
+        self.player.rect.x = p.get("x", self.player.rect.x)
+        self.player.rect.y = p.get("y", self.player.rect.y)
+        self.player.hp = clamp(p.get("hp", self.player.hp), 0, self.player.hp_max)
+        self.player.keys = p.get("keys", 0)
+        self.player.coins = p.get("coins", 0)
+        self.player.speed = p.get("speed", self.player.speed)
+        self.player.attack_cool = p.get("cool", self.player.attack_cool)
+        self.player.hp_max = p.get("hp_max", self.player.hp_max)
+
+        if schema >= 2:
+            wname = p.get("weapon") or "Rusty Sword"
+            if wname in self.wep_dict:
+                self.player.weapon = Weapon(wname, self.wep_dict[wname])
+                self.player.weapon.on_equip(self.player)
+            else:
+                if "Rusty Sword" in self.wep_dict:
+                    self.player.weapon = Weapon("Rusty Sword", self.wep_dict["Rusty Sword"])
+                    self.player.weapon.on_equip(self.player)
+            self.player.relics = list(p.get("relics", []))
+            apply_relics_to_player(self.player, self.relic_dict)
+        else:
+            if "Rusty Sword" in self.wep_dict:
+                self.player.weapon = Weapon("Rusty Sword", self.wep_dict["Rusty Sword"])
+                self.player.weapon.on_equip(self.player)
+
+        def tiles_to_rects(tlst): return [rect_from_tile(tx, ty) for tx, ty in tlst]
+        self.potions = tiles_to_rects(data.get("potions", []))
+        self.keys = tiles_to_rects(data.get("keys", []))
+        self.coins = tiles_to_rects(data.get("coins", []))
+        self.doors = tiles_to_rects(data.get("doors", []))
+        self.open_doors = tiles_to_rects(data.get("open_doors", []))
+        self.arena_doors = tiles_to_rects(data.get("arena_doors"))
+        self.arena_active = data.get("arena_active", False)
+        # enemy/boss
+        self.enemies = [Enemy(e["x"], e["y"], elite=e.get("elite", False), mods=e.get("mods", [])) for e in data.get("enemies", [])]
+        for ent, d in zip(self.enemies, data.get("enemies", [])):
+            ent.hp = d.get("hp", ent.hp)
+            ent.effects = restore_effects(d.get("effects"))
+            ent.apply_mods()
+        self.ranged = [RangedEnemy(r["x"], r["y"], elite=r.get("elite", False), mods=r.get("mods", [])) for r in data.get("ranged", [])]
+        for ent, d in zip(self.ranged, data.get("ranged", [])):
+            ent.hp = d.get("hp", ent.hp)
+            ent.effects = restore_effects(d.get("effects"))
+            ent.set_world(self)
+        b = data.get("boos")
+        if b:
+            self.boss = Boss(b["x"], b["y"])
+            self.boss.hp = b.get("hp", self.boss.hp)
+        self.seen = set(tuple(x) for x in data.get("seen", []))
+        
+#------------
+# elite roll
+#------------
+MELEE_MOD_POOL = ["tanky", "haste", "regen", "aura"]
+RANGED_MOD_POOL = ["tanky", "haste", "rapid", "multishot"]
+def roll_elite(melee: bool, rate: float):
+    elite = (random.random() < rate)
+    mods = []
+    if elite:
+        pool = MELEE_MOD_POOL if melee else RANGED_MOD_POOL
+        n = 1 + (random.random() < 0.35) # 35% 확률로 2개
+        mods = random.sample(pool, k=n)
+    return elite, mods
+
+#=================
+# shop
+#=================
+class ShopState:
+    def __init__(self):
+        self.open = False
+        self.prices = {"hp": 5, "speed": 5, "cool": 6}
+    def toggle(self, opening): self.open = opening
+    def try_buy(self, player: Player, item: str, wep_dict=None, relic_dict=None):
+        if item not in self.prices: return False
+        price = self.prices[item]
+        if player.coins < price: return False
+        player.coins -= price
+        if item=="hp":
+            player.hp_max += 1
+            player.hp = min(player.hp_max, player.hp+1)
+            self.prices[item] = int(price*1.4+1)
+        elif item=="speed":
+            player.speed = min(player.base_speed*1.8, player.speed + 12)
+            self.prices[item] = int(price*1.6+1)
+        elif item=="cool":
+            player.attack_cool = max(0.22, player.attack_cool - 0.04)
+            self.prices[item] = int(price*1.6+1)
+        elif item=="bow":
+            cfg = (wep_dict or {}).get("Short Bow", {"type":"projectiles","count":1,"speed":260,"damage":1,"coooldown":0.55})
+            player.weapon = Weapon("Short Bow", cfg)
+            player.weapon.on_equip(player)
+            self.prices[item] = int(price*1.7+1)
+        elif item=="relic_boots":
+            player.relics.append("Swift Boots")
+            apply_relics_to_player(player, relic_dict or {})
+            self.prices[item] = int(price*1.8+1)
+        return True
     
-       
+# ======================
+# apply relic 
+# ======================
+def apply_relics_to_player(player: Player, relic_dict: dict):
+    player.poison_bonus = 0.0
+    for name in player.relics:
+        r = relic_dict.get(name)
+        if not r: continue
+        stat, val = r.get("stat"), float(r.get("value", 0))
+        if stat == "speed_flat":
+            player.speed = min(Player.base_speed*1.8, player.speed + val)
+        elif stat == "poison_chance_add":
+            player.poison_bonus += val
+
+# =================
+# 랜더링
+# =================
+def has_poison(ent):
+    for eff in getattr(ent, "effects", []):
+        if isinstance(eff, PoisonEffect): return True
+        if getattr(eff, "id", "") == "poison": return True
+    return False
+
+def draw_world(screen, world: World, font, shake,fow_surface, options, shop_ui: ShopState):
+    #background tile
+    screen.fill(COLORS["bg"])
+    for ty, row in enumerate(world.level):
+        for tx, ch in enumerate(row):
+            rect = rect_from_tile(tx, ty)
+            if ch=='#': pygame.draw.rect(screen, COLORS["wall"], rect)
+            elif ch=='~': pygame.draw.rect(screen, COLORS["water"], rect)
+            elif ch=='G': pygame.draw.rect(screen, COLORS["goal"], rect)
+            else: pygame.draw.rect(screen, COLORS["floor"], rect)
+    # door/ arena_door/ shop
+    for r in world.doors: pygame.draw.rect(screen, COLORS["door"], r)
+    for r in world.arena_doors: pygame.draw.rect(screen, COLORS["arena"], r)
+    for r in world.open_doors: pygame.draw.rect(screen, (180, 140, 90), r.inflate(-8,-8))
+    for r in world.shops: pygame.draw.rect(screen, COLORS["shop"], r.inflate(-6,-6))
+    # item
+    for r in world.coins: pygame.draw.circle(screen, COLORS["coin"], r.center, 6)
+    for r in world.keys: pygame.draw.rect(screen, COLORS["eky"], r.inflate(-12,-12))
+    for r in world.potions: pygame.draw.rect(screen, COLORS["potions"], r.inflate(-10, -10))
+    # enemy/ boss
+    for e in world.enemies:
+        if e.alive():
+            pygame.draw.rect(screen, COLORS["eney"], e.rect)
+            if e.elite:
+                pygame.draw.rect(screen, COLORS["elite"], e.rect.inflate(6,6), 2)
+            if has_poison(e):
+                pygame.draw.rect(screen, COLORS["poison_glow"], e.rect.inflate(4,4), 2)
+    for e in world.ranged:
+        if e.alive():
+            pygame.draw.rect(screen, COLORS["ranged"], e.rect)
+            if e.elite:
+                pygame.draw.rect(screen, COLORS["elite"], e.rect.inflate(6,6), 2)
+            if has_poison(e):
+                pygame.draw.rect(screen, COLORS["poison_glow"], e.rect.inflate(4,4), 2)
+    if world.boss and world.boss.alive():
+        pygame.draw.rect(screen, COLORS["boss"], world.boss.rect, border_radius=4)
+        bw = clamp(int((world.boss.hp/40.0)*200), 0, 200)
+        pygame.draw.rect(screen, (30, 30, 30), (SCREEN_W//2-100, 8, 200, 8))
+        pygame.draw.rect(screen, (230,70,70), (SCREEN_W//2-100, 8, bw, 8))
+    #탄환
+    for b in world.bullets:
+        if b.alive: pygame.draw.circle(screen, COLORS["bullets"], (int(b.x), int(b.y)), b.radius)
+    #레이저
+    for lz in world.lasers:
+        lz.draw(screen)
+    # player
+    px, py = world.player.center()
+    color = COLORS["player"]
+    if world.player.i_frames>0 and int(pygame.time.get_ticks()/60)%2==0:
+        color = COLORS["hurt"]
+    sx, sy = (random.randint(-2,2), random.randint(-2,2)) if (shake>0 and options["screenshake"]) else (0,0)
+    pygame.draw.circle(screen, color, (px+sx, py+sy), world.player.r)
+    # ------- Fog-of-War ------
+    fov_r = options["fov_radius"]
+    visible = set()
+    pxc, pyc = world.player.center()
+    fow_surface.fill((0,0,0,0))
+    for ty, row in enumerate(world.level):
+        for tx, ch in enumerate(row):
+            cx, cy = tx*TILE + TILE//2, ty*TILE + TILE//2
+            if length(pxc-cx, pyc-cy) <= fov_r:
+                visible.add((tx, ty))
+    world.seen.update(visible)
+    for ty, row in enumerate(world.level):
+        for tx, ch in enumerate(row):
+            r = rect_from_tile(tx, ty)
+            if (tx,ty) not in world.seen:
+                s = pygame.Surface((r.w, r.h), pygame.SRCALPHA); s.fill((0,0,0,220)); fow_surface.blt(s, r.topleft)
+            elif (tx, ty) not in visible:
+                s = pygame.Surface((r.w, r.h), pygame.SRCALPHA); s.fill((0,0,0,120)); fow_surface.blit(s, r.topleft)
+    screen.blit(fow_surface, (0,0))
+    # HUD
+    hud_rect = pygame.Rect(0, 0, SCREEN_W, 44)
+    pygame.draw.rect(screen, COLORS["hud_back"], hud_rect)
+    enemies_left = sum(1 for e in world.enemies if e.alive()) + sum(1 for e in world.ranged if e.alive()) + (1 if (world.boss and world.boss.alive()) else 0)
+    weapon_name = world.player.weapon.name if world.player.weapon else "None"
+    line1 = (f"HP {world.player.hp}/{world.player.hp_max} Potions {len(world.potions)} Keys {world.player.keys}"
+             f"Coins {world.player.coins} Enemies {enemies_left} Stage {world.level_index+1}/{len(world.levels_data)} Weapon {weapon_name}")
+    screen.blit(font.render(line1, True, COLORS["hud_text"]), (8, 4))
+    # stanima bar
+    bar_x, bar_y, bar_w, bar_h = 8, 24, 180, 10
+    pygame.draw.rect(screen, (30,30,30), (bar_x-1, bar_y-1, bar_w+2, bar_h+2))
+    ration = world.player.stamina / world.player.stamina_max
+    pygame.draw.rect(screen, (90,160,90), (bar_x, bar_y, int(bar_w*ration), bar_h))
+    cd = max(0.0, world.player.dash_cd_timer)
+    screen.blit(font.rengder(f"DashCD {cd:.1f}s", True, (230,230,230)), (bar_x + bar_w + 8, bar_y-2))
+    draw_minimap(screen, world)
+    if shop_ui.open:
+        draw_shop(screen, font, shop_ui)
+
+def draw_minimap(screen, world: World):
+    margin = 8
+    scale = 0.2
+    mw, mh = int(SCREEN_W*scale), int(SCREEN_H*scale)
+    x0, y0 = SCREEN_W - mw - margin + 48
+    pygame.draw.rect(screen, (0,0,0), (x0-2, y0-2, mw+4, mh+4))
+    pygame.draw.rect(screen, (18,18,22), (x0, y0, mw, mh))
+    for ty, row in enumerate(world.level):
+        for tx, ch in enumerate(row):
+            rect = pygame.Rect(x0 + int(tx*TILE*scale), y0 + int(ty*TILE*scale), int(TILE*scale), int(TILE*scale))
+            if ch=='#': pygame.draw.rect(screen, (70,70,90), rect)
+            elif ch=='G': pygame.draw.rect(screen, (30120,40), rect)
+            elif ch=='S': pygame.draw.rect(screen, (100,180,100), rect)
+    px,py = world.player.center()
+    pygame.draw.circle(screen, (250,250,90), (x0+int(px*scale), y0+int(py*scale)), max(2, int(world.player.r*scale)))
+
+def draw_center_message(screen, font_big, lines):
+    shadow = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+    shadow.fill((0,0,0,160))
+    screen.blit(shadow, (0,0))
+    y = SCREEN_H//2 - len(lines)*18
+    for ln in lines:
+        sf = font_big.render(ln, True, (240,240,240))
+
+
+
+
