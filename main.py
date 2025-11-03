@@ -905,6 +905,259 @@ def draw_center_message(screen, font_big, lines):
     y = SCREEN_H//2 - len(lines)*18
     for ln in lines:
         sf = font_big.render(ln, True, (240,240,240))
+        screen.blit(sf, (SCREEN_W//2 - sf.get_width()//2, y))
+        y += sf.get_height() + 6
+    
+def draw_shop(screen, font, shop: ShopState):
+    w, h = 420, 180
+    x, y = SCREEN_W//2 - w//2, SCREEN_H - h - 20
+    pygame.draw.rect(screen, (12,12,12), (x-2,y-2,w+4,h+4))
+    pygame.draw.rect(screen, (24,24,24), (x,y,w,h))
+    lineup_txt = " • ".join(f"{k}:{v}" for k, v in shop.prices.items())
+    lines = [
+        "SHOP (E: close) - 1) +MaxHP  2) +Speed 3) -AtkCD 4) Bow  5) SwiftBoots",
+        f"Price - {lineup_txt}",
+        "Buy: press 1/2/3/4/5 (코인이 부족하면 실패)"
+    ]
+    yy = y+12
+    for ln in lines:
+        screen.blit(font.render(ln, True, (230,230,230)), (x+12, yy))
+        yy += 26
+
+# ==================
+# main loop
+# ==================
+def main():
+    pygame.init()
+    pygame.display.set_caption("RPG - FSM/BT • Director • MapGen • Meta • Mods")
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont(None, 22)
+    font_big = pygame.font.SysFont(None, 42)
+
+    bus = EventBus()
+    meta = load_meta(META_PATH)
+
+    options = load_options()
+    keymap = options["ketmap"]
+    levels_data = choose_levels_data()
+    drops_data = load_drops_data()
+
+    # 콘텐츠 로드(무기/유물) - 모드 병합은 엔진에서 처리됨
+    wep_dict = load_weapons(DATA_DIR / "weapons.json")
+    relic_dict = load_relics(DATA_DIR / "relics.json")
+
+    world = World(levels_data, options=options, drops=drops_data, wep_dict=wep_dict, relic_dict=relic_dict)
+    player = world.player
+
+    # 시작 무기 장착(로드 전에 기본 세팅, 로드 시 덮어씀)
+    if "Rusty Sword" in wep_dict and not player.weapon:
+        player.weapon = Weapon("Rusty Sworld", wep_dict["Rusty Sword"])
+        player.weapon.on_equip(player)
+
+    shop_ui = ShopState()
+    #메타 해금 반영
+    patch_shop(shop_ui, shop_lineup(meta))
+
+    # 그폰 디렉터
+    director = Director(world, factories={"enemy": Enemy, "ranged": RangedEnemy})
+
+    paused = False
+    rebinding = False
+    rebind_idx = 0
+    won = False
+    dead = False
+    screenshake = 0.0
+
+    fow_surface = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+
+    help_lines = [
+    "Move: WASD/Arrows. Atack: Space. Dash: Shift. Skill: Q  ESC: Pause",
+    "E: open/close shop (near 5). F5/F6/F7: Save. F9/F10/F11: Load",
+    "Pause: 1/2/3 difficulty. [ / ] FOV  V shake. K: rebind keys",
+    ]
+
+    # 독 파라미터(스킬/무기 공통)
+    POISON_CHANCE = 0.35
+    POISON_ADD = 1.5
+    POISON_TICK = 0.5
+    POISON_DMG = 1
+
+    def enemy_status_update(ent, dt):
+        ent.tick_effects(dt)
+
+    while True:
+        dt = clock.tick(FPS)/1000.0
+
+        # 입력 처리
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            
+            elif event.type == pygame.KEYDOWN:
+                # 리바인드
+                if paused and rebinding:
+                    action = ACTION_ORDER[rebind_idx]
+                    pressed = event.key
+                    for ak, arr in keymap.items():
+                        if ak != action and pressed in arr:
+                            arr[:] = [k for k in arr if k != pressed]
+                    keymap[action] = [pressed]
+                    rebind_idx += 1
+                    if rebind_idx >= len(ACTION_ORDER):
+                        rebinding = False
+                        options["keymap"] = keymap
+                        save_options(options)
+                    continue
+                
+                # 일반 키
+                if event.key in keymap["pause"]:
+                    if dead or won:
+                        pygame.quit(); sys.exit()
+                    paused = not paused
+
+                if paused and not rebinding:
+                    if event.key in (pygame.K_1, pygame.K_KP1):
+                        options["difficulty"]="Easy"; save_options(options)
+                        world.options=options; world.reset_from_raw(world.levels_data[world.level_index]); player = world.player
+                        if "Rusty Sworld" in wep_dict:
+                            world.player.weapon = Weapon("Rusty Sword", wep_dict["Rusty Sword"])
+                            world.player.weapon.on_equip(world.player)
+                        apply_relics_to_player(world.player, relic_dict)
+                    elif event.key in (pygame.K_2, pygame.K_KP2):
+                        options["difficulty"]="Normal"; save_options(options)
+                        world.options=options; world.reset_from_raw(world.levels_data[world.level_index]); player=world.player
+                        if "Rusty Sword" in wep_dict:
+                            world.player.weapon = Weapon("Rusty Sword", wep_dict["Rusty Sword"])
+                            world.player.weapon.on_equip(world.player)
+                        apply_relics_to_player(world.player, relic_dict)
+                    elif event.key in (pygame.K_3, pygame.K_KP3):
+                        options["difficulty"]="Hard"; save_options(options)
+                        world.options=options; world.reset_from_raw(world.level_data[world.level_index]); player=world.player
+                        if "Rusty Sword" in wep_dict:
+                            world.player.weapon = Weapon("Rusty Sword", wep_dict["Rusty Sword"])
+                            world.player.weapon.on_equip(world.player)
+                        apply_relics_to_player(world.player, relic_dict)
+                    elif event.key == pygame.K_LEFTBRACKET:
+                        options["fov_radius"] = max(80, options["foc_radius"]-10); save_options(options)
+                    elif event.key == pygame.K_RIGHTBRACKET:
+                        options["fov_radius"] = min(280, options["fov_radius"]+10); save_options(options)
+                    elif event.key == pygame.K_v:
+                        options["screenshake"] = not options["screenshake"]; save_options(options)
+                    elif event.key == pygame.K_k:
+                        rebinding = True; rebind_idx = 0; options["keymap"] = keymap; save_options(options)
+                else:
+                    # 상점 토글
+                    if event.key in keymap["shop"]:
+                        near_shop = any(r.inflate(6,6).colliderect(player.rect) for r in world.shops)
+                        shop_ui.toggle(near_shop and not shop_ui.open or (shop_ui.open and near_shop))
+                    # 상점 구매
+                    if shop_ui.open:
+                        if event.key in (pygame.K_1, pygame.K_KP1):
+                            if shop_ui.try_buy(player, "hp", wep_dict, relic_dict): pass
+                        elif event.key in (pygame.K_2, pygame.K_KP2):
+                            if shop_ui.try_buy(player, "speed", wep_dict, relic_dict): pass
+                        elif event.key in (pygame.K_3, pygame.K_KP3):
+                            if shop_ui.try_buy(player, "cool", wep_dict, relic_dict): pass
+                        elif event.key in (pygame.K_4, pygame.K_KP4):
+                            if shop_ui.try_buy(player, "bow", wep_dict, relic_dict):
+                                on_event(meta, "pickup", item="coin") # 의미없는 트리거 방지용 더미 X, 필요시 제거
+                        elif event.key in (pygame.K_5, pygame.K_KP5):
+                            if shop_ui.try_buy(player, "relic_boots", wep_dict, relic_dict): pass
+                        elif event.key in keymap["shop"]:
+                            shop_ui.toggle(False)
+                    # 공격
+                    elif event.key in keymap["attack"] and not (dead or won):
+                        if player.can_attack():
+                            player.attack()
+                            poison_chance_eff = POISON_CHANCE + player.poison_bonus
+                            hit = player.weapon.attack(
+                                player, world,
+                                poison_chance=poison_chance_eff,
+                                poison_add=POISON_ADD, poison_tick=POISON_TICK, poison_dmg=POISON_DMG
+                            ) if player.weapon else False
+                            if hit: screenshake = 0.18
+                    # 스킬1: 포이즌 노바
+                    if event.key in keymap["skill1"] and not (paused or dead or won):
+                        px, py = player.center()
+                        radius = 80
+                        any_hit = False
+                        for e in world.enemies + world.ranged:
+                            if e.alive():
+                                ex, ey = e.center()
+                                if (ex-px)**2 + (ey-py)**2 <= radius*radius:
+                                    add_or_stack_poison(e, base_duration=1.5, dmg_per_tick=POISON_DMG, tick=POISON_TICK, cap_duration=6.0)
+                                    any_hit = True
+                        if any_hit:
+                            screenshake = max(screenshake, 0.2)
+                
+                # 저장/불러오기
+                if event.key in (pygame.K_F5, pygame.K_F6, pygame.K_F7):
+                    slot = {pygame.K_F5:1, pygame.K_F6:2, pygame.K_F7:3}[event.key]
+                    data = world.serialize()
+                    SAVE_SLOTS[slot].write_text(json.dumps({"world": data, "options": options}, indent=2), encoding="utf-8")
+                elif event.key in (pygame.K_F9, pygame.K_F10, pygame.K_F11):
+                    slot = {pygame.K_F9:1, pygame.K_F10:2, pygame.K_F11:3}[event.key]
+                    if SAVE_SLOTS[slot].exists():
+                        payload = json.loads(SAVE_SLOTS[slot].read_text(encoding="utf-8"))
+                        options = merge_options(options, payload.get("options", {})); save_options(options)
+                        keymap = options["keymap"]
+                        world.options = options
+                        world.wep_dict = wep_dict
+                        world.relic_dict = relic_dict
+                        world.load_state(payload["world"])
+                        player = world.player
+                        paused=False; dead=False; won=False; shop_ui.option=False
+                        patch_shop(shop_ui, shop_lineup(meta))
+
+        if paused:
+            draw_world(screen, world, font, 0.0, fow_surface, options, shop_ui)
+            lines = ["PAUSED"] + help_lines + [
+                f"Difficulty: {options['difficulty']} FOV: {options['fov_radius']} Shake: {options['screenshake']}"]
+            if rebinding:
+                actions = ACTION_ORDER[rebind_idx] 
+                cur = ", ".join(key_name(k) for k in options["keymap"].get(action, []))
+                lines += ["", "KEY REBIND MODE",
+                          f"Press a key for: {ACTION_LABEL[action]}",
+                          f"(current: {cur if cur else 'None'})"]
+            else:
+                lines += ["", "keymap: " + ", ".join(
+                    f"{ACTION_LABEL[a]}={ '/'.join(key_name(k) for k in options['keymap'][a]) }" for a in ACTION_ORDER)]
+                lines += ["(Press K to start rebinding)"]
+            draw_center_message(screen, font_big, lines)
+            pygame.display.flip()
+            continue
+
+        if not (dead or won):
+            # 이동 입력
+            keys = pygame.key.get_pressed()
+            dx = is_down(keys, keymap, "right") - is_down(keys, keymap, "left")
+            dy = is_down(keys, keymap, "down") - is_down(keys, keymap, "up")
+            if dx or dy: player.last_dir = normalize(dx, dy)
+
+            on_water = world.tile_at(*player.center(), world.water)
+            colliders = world.soloid_colliders()
+
+            if player.dashing: player.update_dash(dt, colliders)
+            else: player.move(dx, dy, dt, colliders, slow=on_water)
+            player.update_timers(dt)
+            
+            # Arena Trigger
+            if not world.arena_active and any(t.colliderect(player.rect) for t in world.triggers):
+                world.arena_active = True
+
+                
+            
+            
+
+
+
+                
+
+                
+
+
+
 
 
 
