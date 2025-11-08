@@ -1146,19 +1146,161 @@ def main():
             if not world.arena_active and any(t.colliderect(player.rect) for t in world.triggers):
                 world.arena_active = True
 
-                
+            #  적 AI + 상태 이상 틱 + 사망 드랍
+            for e in world.enemies:
+                if e.alive():
+                    e.ai(player.center(), world.walls, dt, world=world)
+                    if e.try_attack(player): screenshake = max(screenshake, 0.22)
+                    enemy_status_update(e, dt)
+                elif not e.dead_drop_done:
+                    e.dead_drop_done = True
+                    world.maybe_drop("enemy", e.center(), elite=e.elite)
+                    bus.emit("enemy_died", kind="enemy", pos=e.center(), elite=e.elite)
+                    on_event(meta, "enemy_died"); save_meta(META_PATH, meta)
+            for e in world.ranged:
+                if e.alive():
+                    e.ai(player.center(), world.walls, dt, world.bullets)
+                    enemy_status_update(e, dt)
+                elif not e.dead_drop_done:
+                    e.dead_drop_done = True
+                    world.maybe_drop("ranged", e.center(), elite=e.elite)
+                    bus.emit("enemy_died", kind="ranged", pos=e.center(), elite=e.elite)
+                    on_event(meta, "enemy_died"); save_meta(META_PATH, meta)
+
+            if world.boss and world.boss.alive():
+                world.boss.ai(player.center(), world.walls, dt, world.bullets, world.lasers, world)
+            elif world.boss and not world.boss.alive():
+                if getattr(world.boss, "_drop_done", False) is False:
+                    world.boss._drop_done = True
+                    world.maybe_drop("boss", world.boss.center(), elite=True)
+                    bus.emt("enemy_died", kind="boss", pos=world.boss.center(), elite=True)
+                    on_event(meta, "enemy_died"); save_meta(META_PATH, meta)
+
+            # 탄환
+            for b in world.bullets:
+                if b.alive:
+                    b.update(dt, world.walls, player.center())
+                    if b.alive and b.rect().colliderect(player.rect):
+                        player.hurt(b.dmg); b.alive=False; screenshake=max(screenshake,0.2)
+            world.bullets = [b for b in world.bullets if b.alive]
+
+            # 레이저
+            hit_by_laser = False
+            for lz in world.lasers:
+                if lz.update(dt, world.walls, world.player.center(), world.player.r):
+                    hit_by_laser = True
+            if hit_by_laser:
+                player.hurt(2)
+            world.lasers = [lz for lz in world.lasers if not lz.done]
+
+            # 상호작용: 포션 / 열쇠 / 코인 / 문
+            if not shop_ui.open:
+                take=[]
+                for r in world.potions:
+                    if r.colliderect(player.rect): take.append(r); player.hp = clamp(player.hp+2, 0, player.hp_max)
+                for r in take: world.potions.remove(r)
+                take=[]
+                for r in world.kets:
+                    if r.colliderect(player.rect): take.append(r); player.keys += 1
+                for r in take: world.keys.remove(r)
+                take=[]
+                for r in world.coins:
+                    if r.colliderect(player.rect):
+                        take.append(r); player.coins += 1
+                        bus.emit("pickup", item="coin", pos=r.center); on_event(meta, "pickup", item="coin"); save_meta(META_PATH, meta)
+                for r in take: world.coins.remove(r)
+
+                # 문 열기
+                still=[]
+                for r in world.doors:
+                    if r.colliderect(player.rect):
+                        if player.keys>0:
+                            player.keys-=1; world.open_doors.append(r); player.rect.y -= 2
+                        else:
+                            still.append(r)
+                    else:
+                        still.append(r)
+                world.doors = still
+
+            # 아레나 클리어 체크
+            if world.arena_active:
+                alive_count = (sum(1 for e in world.enemies if e.alive()) +
+                               sum(1 for e in world.ranged if e.alive()) +
+                               (1 if (world.boss and world.boss.alive()) else 0))
+                if alive_count==0:
+                    world.arena_active=False
+                    for r in world.arena_doors: world.open_doors.append(r)
+                    world.arena_doors=[]
+                    bus.emit("arena_clear", level=world.level_index)
+                    on_event(meta, "arena_clear", level=world.level_index)
+                    #해금 반영 상점 라인업 갱신
+                    patch_shop(shop_lineup(meta))
+                    save_meta(META_PATH, meta)
             
+            # 디랙터(뤠이브 자동화)
+            director.update(dt)
+
+            # 승리/사망/스테이지 전화
+            if player.hp<=0: dead=True
+            if world.goal and player.rect.colliderect(world.goal):
+                advanced = world.next_level()
+                if not advanced: won=True
+                else:
+                    player = world.player
+                    if not player.weapon and "Rusty Sword" in wep_dict:
+                        player.weapon = Weapon("Rusty Sword", wep_dict["Rusty Sword"])
+                        player.weapon.on_equip(player)
+                    apply_relics_to_player(player, relic_dict)
+                    shop_ui.open=False
+
+        # 셰이크 감쇠
+        if screenshake>0: screenshake -= dt
+        else: screenshake = 0.0
+
+        #render
+        draw_world(screen, world, font, screenshake, fow_surface, options, shop_ui)
+        if won:
+            draw_center_message(screen, font_big, ["YOU CLEARED EVERYTHING!", "Pause to quit F9/F10/F11: load slot"])
+        elif dead:
+            draw_center_message(screen, font_big, ["YOU DIED", "Pause to quit F9/F10/F11: load slot"])
+        else:
+            if (pygame.time.get_ticks()//1000)%6<3:
+                tip = "FSM/BT • Director • MapGen • Meta • Mods"
+                screen.blit(font.render(tip, True, (240,240,240)), (8,48))
+        
+        pygame.display.flip()
+
+# ========================
+# options load / save
+# ========================
+def load_options():
+    if OPTIONS_PATH.exists():
+        try:
+            data = json.loads(OPTIONS_PATH.read_text(encoding="utf-8"))
+            km = data.get("keymap")
+            if km:
+                for k, arr in km.items():
+                    km[k] = [int(x) for x in arr]
+                data["keymap"] = km
+            return merge_options(DEFAULT_OPTIONS, data)
+        except Exception:
+            return DEFAULT_OPTIONS.copy()
+    return DEFAULT_OPTIONS.copy()
+
+def save_options(opts):
+    try:
+        data = dict(opts)
+        data["keymap"] = {k: list(map(int, v)) for k, v in data.get("keymap", {}).items()}
+        OPTIONS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+# =====================
+# 진입점
+# =====================
+if __name__ == "__main__":
+    main()
+
+                             
+
             
-
-
-
-                
-
-                
-
-
-
-
-
-
-
